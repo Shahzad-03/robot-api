@@ -35,47 +35,38 @@ app.get("/api/health", async (req, res) => {
 });
 
 // --------------------
-// Mazes
+// Teams (ERD: team + members + cars)
 // --------------------
-app.get("/api/mazes", async (req, res) => {
-  try {
-    const r = await pool.query(`SELECT * FROM "Maze" ORDER BY maze_id`);
-    res.json(r.rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// --------------------
-// Algorithms
-// --------------------
-app.get("/api/algorithms", async (req, res) => {
-  try {
-    const r = await pool.query(`SELECT * FROM "Algorithm" ORDER BY algorithm_id`);
-    res.json(r.rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// --------------------
-// Teams + members (nested)
-// --------------------
+// Returns:
+// [
+//   {
+//     team_id, team_name, team_leader,
+//     members: { team_id, team_leader, member1..member4, mobile_contact, email_contact } | null,
+//     cars: [{ car_id, car_name, car_type, team_id }, ...]
+//   }
+// ]
 app.get("/api/teams", async (req, res) => {
   try {
-    const teamsR = await pool.query(`SELECT * FROM team ORDER BY team_code`);
-    const membersR = await pool.query(`SELECT * FROM team_member ORDER BY team_id, member_id`);
+    const teamsR = await pool.query(`SELECT * FROM team ORDER BY team_id`);
+    const membersR = await pool.query(`SELECT * FROM members`);
+    const carsR = await pool.query(`SELECT * FROM car ORDER BY car_id`);
 
     const membersByTeam = new Map();
     for (const m of membersR.rows) {
-      const key = m.team_id;
-      if (!membersByTeam.has(key)) membersByTeam.set(key, []);
-      membersByTeam.get(key).push(m);
+      membersByTeam.set(m.team_id, m);
+    }
+
+    const carsByTeam = new Map();
+    for (const c of carsR.rows) {
+      const key = c.team_id;
+      if (!carsByTeam.has(key)) carsByTeam.set(key, []);
+      carsByTeam.get(key).push(c);
     }
 
     const result = teamsR.rows.map((t) => ({
       ...t,
-      members: membersByTeam.get(t.team_id) || [],
+      members: membersByTeam.get(t.team_id) || null,
+      cars: carsByTeam.get(t.team_id) || [],
     }));
 
     res.json(result);
@@ -85,165 +76,87 @@ app.get("/api/teams", async (req, res) => {
 });
 
 // --------------------
-// Runs (joined for UI display)
+// Cars (ERD: car belongs to team)
 // --------------------
-app.get("/api/runs", async (req, res) => {
+app.get("/api/cars", async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT
-        r.run_id,
-        r.run_time,
-        r.path_length,
-        r.goal_reached,
-        r.nodes_explored,
-        r.date,
-        r.notes,
-
-        r.maze_id,
-        m.goal_type,
-        m.no_of_tiles,
-
-        r.algorithm_id,
-        a.type AS algorithm_type,
-
-        t.team_code,
-        t.team_name,
-        t.contact_email,
-
+        c.car_id,
+        c.team_id,
         c.car_name,
-        c.car_type
-
-      FROM "Run" r
-      JOIN "Maze" m ON r.maze_id = m.maze_id
-      JOIN "Algorithm" a ON r.algorithm_id = a.algorithm_id
-      LEFT JOIN team t ON r.team_id = t.team_id
-      LEFT JOIN car c ON r.car_id = c.car_id
-      ORDER BY r.date DESC NULLS LAST, r.run_id DESC
-      LIMIT 200
+        c.car_type,
+        t.team_name,
+        t.team_leader
+      FROM car c
+      JOIN team t ON c.team_id = t.team_id
+      ORDER BY c.car_id
     `);
-
     res.json(r.rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST run (robot OR website form)
-app.post("/api/runs", async (req, res) => {
-  try {
-    const {
-      run_id,
-      maze_id,
-      algorithm_id,
-      run_time,
-      path_length,
-      goal_reached,
-      nodes_explored,
-      date,
-      notes,
-      team_code,
-    } = req.body;
-
-    if (!run_id || !maze_id || !algorithm_id || run_time == null) {
-      return res.status(400).json({
-        error: "Required: run_id, maze_id, algorithm_id, run_time",
-      });
-    }
-
-    let team_id = null;
-    let car_id = null;
-
-    if (team_code) {
-      const teamR = await pool.query(`SELECT team_id FROM team WHERE team_code=$1 LIMIT 1`, [
-        team_code,
-      ]);
-      if (teamR.rows.length) {
-        team_id = teamR.rows[0].team_id;
-
-        const carR = await pool.query(`SELECT car_id FROM car WHERE team_id=$1 LIMIT 1`, [team_id]);
-        if (carR.rows.length) car_id = carR.rows[0].car_id;
-      }
-    }
-
-    await pool.query(
-      `
-      INSERT INTO "Run"
-        (run_id, maze_id, algorithm_id, run_time, path_length, goal_reached, nodes_explored, date, team_id, car_id, notes)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      `,
-      [
-        run_id,
-        maze_id,
-        algorithm_id,
-        Number(run_time),
-        path_length == null ? 0 : Number(path_length),
-        goal_reached == null ? false : Boolean(goal_reached),
-        nodes_explored == null ? 0 : Number(nodes_explored),
-        date ?? new Date().toISOString().slice(0, 10),
-        team_id,
-        car_id,
-        notes ?? null,
-      ]
-    );
-
-    res.status(201).json({ ok: true, run_id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // --------------------
-// Logbook
+// Runs (ERD: run belongs to car; car belongs to team; team has members)
 // --------------------
-// GET /api/logbook (optional: ?team_code=T01)
-app.get("/api/logbook", async (req, res) => {
+// Optional filters:
+//   /api/runs?team_id=T01
+//   /api/runs?car_id=C01
+app.get("/api/runs", async (req, res) => {
   try {
-    const { team_code } = req.query;
+    const { team_id, car_id } = req.query;
 
-    if (team_code) {
-      const r = await pool.query(
-        `
-        SELECT
-          p.post_id,
-          p.title,
-          p.body,
-          p.created_at,
-          p.run_id,
-          p.author_name,
-          p.car_model,
-          t.team_code,
-          t.team_name,
-          t.contact_email
-        FROM "Logbook_Post" p
-        JOIN team t ON p.team_id = t.team_id
-        WHERE t.team_code = $1
-        ORDER BY p.created_at DESC
-        LIMIT 200
-        `,
-        [team_code]
-      );
-      return res.json(r.rows);
+    const where = [];
+    const params = [];
+
+    if (team_id) {
+      params.push(team_id);
+      where.push(`t.team_id = $${params.length}`);
     }
+    if (car_id) {
+      params.push(car_id);
+      where.push(`c.car_id = $${params.length}`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
     const r = await pool.query(
       `
       SELECT
-        p.post_id,
-        p.title,
-        p.body,
-        p.created_at,
-        p.run_id,
-        p.author_name,
-        p.car_model,
-        t.team_code,
+        r.run_id,
+        r.car_id,
+        r.run_time,
+        r.date_recorded,
+        r.run_length,
+        r.algo_type,
+        r.notes,
+
+        c.car_name,
+        c.car_type,
+        c.team_id,
+
         t.team_name,
-        t.contact_email
-      FROM "Logbook_Post" p
-      JOIN team t ON p.team_id = t.team_id
-      ORDER BY p.created_at DESC
+        t.team_leader,
+
+        m.mobile_contact,
+        m.email_contact,
+        m.team_leader AS members_team_leader,
+        m.member1,
+        m.member2,
+        m.member3,
+        m.member4
+
+      FROM "run" r
+      JOIN car c ON r.car_id = c.car_id
+      JOIN team t ON c.team_id = t.team_id
+      LEFT JOIN members m ON m.team_id = t.team_id
+      ${whereSql}
+      ORDER BY r.date_recorded DESC NULLS LAST, r.run_id DESC
       LIMIT 200
-      `
+      `,
+      params
     );
 
     res.json(r.rows);
@@ -252,36 +165,44 @@ app.get("/api/logbook", async (req, res) => {
   }
 });
 
-// POST /api/logbook
-app.post("/api/logbook", async (req, res) => {
+// POST run (ERD-compliant)
+// Required: run_id, car_id, run_time
+// Optional: date_recorded, run_length, algo_type, notes
+app.post("/api/runs", async (req, res) => {
   try {
-    const { team_code, title, body, run_id, author_name, car_model } = req.body;
+    const { run_id, car_id, run_time, date_recorded, run_length, algo_type, notes } = req.body;
 
-    if (!team_code || !title || !body) {
-      return res.status(400).json({ error: "Required: team_code, title, body" });
+    if (!run_id || !car_id || run_time == null) {
+      return res.status(400).json({
+        error: "Required: run_id, car_id, run_time",
+      });
     }
 
-    const teamR = await pool.query(`SELECT team_id FROM team WHERE team_code=$1 LIMIT 1`, [
-      team_code,
-    ]);
-    if (teamR.rows.length === 0) {
-      return res.status(400).json({ error: `Team not found for team_code: ${team_code}` });
+    // Ensure car exists
+    const carR = await pool.query(`SELECT car_id FROM car WHERE car_id = $1 LIMIT 1`, [car_id]);
+    if (carR.rows.length === 0) {
+      return res.status(400).json({ error: `Car not found for car_id: ${car_id}` });
     }
 
-    const team_id = teamR.rows[0].team_id;
-
-    const insertR = await pool.query(
+    await pool.query(
       `
-      INSERT INTO "Logbook_Post"
-        (team_id, user_id, run_id, title, body, author_name, car_model)
+      INSERT INTO "run"
+        (run_id, car_id, run_time, date_recorded, run_length, algo_type, notes)
       VALUES
-        ($1, NULL, $2, $3, $4, $5, $6)
-      RETURNING post_id
+        ($1, $2, $3, $4, $5, $6, $7)
       `,
-      [team_id, run_id || null, title, body, author_name || null, car_model || null]
+      [
+        String(run_id).trim(),
+        String(car_id).trim(),
+        Number(run_time),
+        date_recorded ? String(date_recorded).slice(0, 10) : new Date().toISOString().slice(0, 10),
+        run_length == null || run_length === "" ? null : Number(run_length),
+        algo_type == null || algo_type === "" ? null : String(algo_type),
+        notes == null || notes === "" ? null : String(notes),
+      ]
     );
 
-    res.status(201).json({ ok: true, post_id: insertR.rows[0].post_id });
+    res.status(201).json({ ok: true, run_id });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
